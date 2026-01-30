@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, Union, Sized
 import torch
 import torch.utils.data
 import transformers
+import torch.nn.functional as F
 from datasets import Dataset, IterableDataset
 from packaging import version
 from transformers import (
@@ -354,6 +355,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates
         self._buffered_inputs = [None] * args.gradient_accumulation_steps
+        self.val_embed = None
+        self.score_top_k = 100
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -470,6 +473,24 @@ class Qwen2VLGRPOTrainer(Trainer):
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        if self.val_embed is None or self._step == 0:
+            tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+            quality_tokens = (
+                "perfect superb outstanding excellent fantastic stunning striking phenomenal brilliant magnificent "
+                "amazing remarkable beautiful awesome breathtaking great good decent fine sharp clear suitable vibrant "
+                "rich vivid bright colorful"
+            )
+            poor_tokens = (
+                "bad terrible awful poor horrible disappointing unacceptable inadequate deficient blurry fuzzy "
+                "compromised chaotic distorted weak mediocre subpar lacking unclear dark noisy low problematic "
+                "insufficient"
+            )
+            pos_inputs = tokenizer(quality_tokens, return_tensors="pt").to(device)
+            neg_inputs = tokenizer(poor_tokens, return_tensors="pt").to(device)
+            embedding_layer = model.get_input_embeddings()
+            positive_vector = embedding_layer(pos_inputs["input_ids"]).mean(dim=1)
+            negative_vector = embedding_layer(neg_inputs["input_ids"]).mean(dim=1)
+            self.val_embed = (positive_vector - negative_vector).detach()
         # Handle both pre-loaded images and image paths
         images = []
         for x in inputs:
@@ -536,6 +557,23 @@ class Qwen2VLGRPOTrainer(Trainer):
         image_grid_thw = prompt_inputs["image_grid_thw"]
 
         with torch.no_grad():
+            scoring_logits = model(
+                prompt_completion_ids, attention_mask=attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw
+            ).logits
+            last_token_logits = scoring_logits[:, prompt_length - 1, :]
+            topk = torch.topk(last_token_logits, self.score_top_k, dim=-1)
+            top_k_logits, top_k_indices = topk.values, topk.indices
+            min_logits = torch.min(top_k_logits, dim=-1, keepdim=True).values
+            shifted_logits = top_k_logits - min_logits
+            sum_logits = torch.sum(shifted_logits, dim=-1, keepdim=True) + 1e-9
+            weights = shifted_logits / sum_logits
+            embedding_layer = model.get_input_embeddings()
+            top_k_embeddings = embedding_layer(top_k_indices)
+            val_embed_unsqueezed = self.val_embed.unsqueeze(0).unsqueeze(0)
+            similarities = F.cosine_similarity(top_k_embeddings, val_embed_unsqueezed, dim=-1)
+            expected_similarity = torch.sum(weights * similarities, dim=-1)
+            pred_scores = expected_similarity * 2 + 3
+
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
             # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
@@ -591,6 +629,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                     for example in inputs:
                         # Repeat each value in the column for `num_generations` times
                         reward_kwargs[key].extend([example[key]] * self.num_generations)
+                reward_kwargs["pred_score"] = pred_scores.tolist()
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
