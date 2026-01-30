@@ -119,7 +119,7 @@ SYSTEM_PROMPT = (
     "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
-SCORE_QUESTION_PROMPT = 'What is your overall rating on the quality of this picture? The rating should be a float between 1 and 5, rounded to two decimal places, with 1 representing very poor quality and 5 representing excellent quality. Return the final answer in JSON format with the following keys: "rating": The score.'
+SCORE_QUESTION_PROMPT = "Please answer with: The quality of this image is [quality description]."
 DIST_QUESTION_PROMPT = 'Analyze the given image and determine if it contains any of the following distortions: "noise", "compression", "blur", or "darken". If a distortion is present, classify its severity as "slight", "moderate", "obvious", "serious", or "catastrophic". Return the result in JSON format with the following keys: "distortion_class": The detected distortion (or "null" if none). and "severity": The severity level (or "null" if none).'
 
 
@@ -275,13 +275,13 @@ class LazySupervisedDataset(Dataset):
 
 
 
-def score_reward(completions, solution, task, image_path, **kwargs):
+def score_reward(completions, solution, task, image_path, pred_score=None, **kwargs):
     """
     Compute the reward based on the format and content of the generated answers.
 
     For the 'score' task:
-      - Extract the JSON string from the <answer> tag and match the "rating" value.
-      - If the model’s rating differs from the ground truth (gt_score_norm) by less than the threshold (default 0.35), reward = 1.0.
+      - Use the regression score derived from logits (pred_score) if available.
+      - If the model’s score differs from the ground truth (gt_score_norm) by less than the threshold (default 0.35), reward = 1.0.
 
     For the 'dist' task:
       - Extract the JSON string from the <answer> tag and match the "distortion_class" and "severity" fields.
@@ -302,9 +302,13 @@ def score_reward(completions, solution, task, image_path, **kwargs):
     subsampled_tasks = task[::num_gen]
     subsampled_solutions = solution[::num_gen]
     subsampled_image_paths = image_path[::num_gen]
+    subsampled_pred_scores = pred_score[::num_gen] if pred_score is not None else None
 
     score_reward_threshold = script_args.score_reward_threshold
     
+    model_score = None
+    model_distortion_class = None
+    model_severity = None
     for i, (t, content, true_sol) in enumerate(zip(subsampled_tasks, contents, subsampled_solutions)):
         reward = 0.0
         try:
@@ -313,12 +317,16 @@ def score_reward(completions, solution, task, image_path, **kwargs):
             if match_answer:
                 answer_content = match_answer.group(1).strip()
                 if t == 'score':
-                    # For scoring tasks, match the "rating" value
-                    match_score = re.search(score_pattern, answer_content)
-                    if match_score:
-                        model_score = float(match_score.group(1))
-                        if abs(model_score - true_sol) < score_reward_threshold:
-                            reward = 1.0
+                    model_score = None
+                    if subsampled_pred_scores is not None:
+                        model_score = float(subsampled_pred_scores[i])
+                    else:
+                        # Fallback to parse numeric score from JSON if provided
+                        match_score = re.search(score_pattern, answer_content)
+                        if match_score:
+                            model_score = float(match_score.group(1))
+                    if model_score is not None and abs(model_score - true_sol) < score_reward_threshold:
+                        reward = 1.0
                 elif t == 'dist':
                     # For degradation detection tasks, match "distortion_class" and "severity"
                     match_dist = re.search(dist_pattern, answer_content, re.DOTALL)
@@ -371,17 +379,14 @@ def format_reward(completions, **kwargs):
     """
     Reward function that checks if the reasoning process is enclosed within <think> and </think> tags,
     and the final answer is enclosed within <answer> and </answer> tags.
-    In addition, the content inside <answer> (after stripping leading/trailing whitespace)
-    must be a JSON-like string where the first non-whitespace character is '{' and the last is '}',
-    and no extra '{' or '}' appear inside.
+    In addition, the content inside <answer> must start with "The quality of this image is".
     """
     pattern = (
         r"^<think>\s*\n"         # <think> tag, optional whitespace, then newline
         r".*?\n"                 # content of think (non-greedy) until a newline
         r"\s*</think>\s*\n"      # closing </think> tag with optional whitespace then newline
         r"<answer>\s*\n"         # <answer> tag with optional whitespace then newline
-        r"\{[^\{\}]*\}"         # JSON content: must start with {, end with }, no nested braces allowed
-        r"\s*\n"                 # optional whitespace then newline after JSON content
+        r"The quality of this image is[\s\S]*?"
         r"\s*</answer>\s*$"      # closing </answer> tag with optional whitespace until end of string
     )
     
