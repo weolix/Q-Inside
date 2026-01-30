@@ -23,13 +23,14 @@ from torch.utils.data import Dataset
 from transformers import Qwen2VLForConditionalGeneration
 
 from math_verify import parse, verify
-from open_r1.trainer import Qwen2VLGRPOTrainer, GRPOConfig
+from trainer import Qwen2VLGRPOTrainer, GRPOConfig
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from transformers import TrainingArguments
 import yaml
 import json
 import random
 import math
+from peft import LoraConfig, TaskType
 
 # ----------------------- Fix the flash attention bug in the current version of transformers -----------------------
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionFlashAttention2, apply_rotary_pos_emb_flashatt, flash_attn_varlen_func
@@ -411,6 +412,21 @@ def main(script_args, training_args, model_args):
     dataset = LazySupervisedDataset(script_args)
 
     trainer_cls = Qwen2VLGRPOTrainer
+    # Prepare PEFT/LoRA config: prefer existing config from `get_peft_config`,
+    # otherwise create a sensible LoRA default.
+    peft_cfg = get_peft_config(model_args)
+    if peft_cfg is None:
+        # Create a default LoRA config.
+        peft_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        )
+        print("Using default LoRA config for PEFT (r=8, alpha=32, dropout=0.1)")
+
     # Initialize the GRPO trainer
     trainer = trainer_cls(
         model=model_args.model_name_or_path,
@@ -418,7 +434,7 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset,
         eval_dataset=None,
-        peft_config=get_peft_config(model_args),
+        peft_config=peft_cfg,
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,

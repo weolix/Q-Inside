@@ -26,6 +26,7 @@ from math_verify import parse, verify
 from open_r1.trainer import Qwen2VLGRPOTrainerComparison, GRPOConfig
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from transformers import TrainingArguments
+from peft import LoraConfig, TaskType
 import yaml
 import json
 import random
@@ -311,6 +312,20 @@ def main(script_args, training_args, model_args):
     dataset = LazyComparisonDataset(script_args)
 
     trainer_cls = Qwen2VLGRPOTrainerComparison
+    
+    # Prepare PEFT/LoRA config
+    peft_cfg = get_peft_config(model_args)
+    if peft_cfg is None:
+        peft_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        )
+        print("Using default LoRA config for PEFT (r=8, alpha=32, dropout=0.1)")
+
     # Initialize the GRPO trainer
     trainer = trainer_cls(
         model=model_args.model_name_or_path,
@@ -318,7 +333,7 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset,
         eval_dataset=None,
-        peft_config=get_peft_config(model_args),
+        peft_config=peft_cfg,
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,

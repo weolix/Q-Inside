@@ -7,3 +7,5 @@ pip install tensorboardx
 pip install qwen_vl_utils torchvision
 pip install flash-attn --no-build-isolation
 pip install transformers==4.51.3
+pip install trl==0.19.1
+
